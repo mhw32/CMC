@@ -59,12 +59,12 @@ def parse_option():
                         help='path to latest checkpoint (default: none)')
 
     # model definition
-    parser.add_argument('--model', type=str, default='alexnet', choices=['alexnet',
+    parser.add_argument('--model', type=str, default='resnet18v2', choices=['alexnet',
                                                                          'resnet50v1', 'resnet101v1', 'resnet18v1',
                                                                          'resnet50v2', 'resnet101v2', 'resnet18v2',
                                                                          'resnet50v3', 'resnet101v3', 'resnet18v3'])
     parser.add_argument('--softmax', action='store_true', help='using softmax contrastive loss rather than NCE')
-    parser.add_argument('--nce_k', type=int, default=16384)
+    parser.add_argument('--nce_k', type=int, default=4096)
     parser.add_argument('--nce_t', type=float, default=0.07)
     parser.add_argument('--nce_m', type=float, default=0.5)
     parser.add_argument('--feat_dim', type=int, default=128, help='dim of feat for inner product')
@@ -150,6 +150,10 @@ def get_train_loader(args):
     train_dataset = ImageFolderInstance(data_folder, transform=train_transform)
     train_sampler = None
 
+    train_samples = train_dataset.dataset.samples
+    train_labels = [train_samples[i][1] for i in range(len(train_samples))]
+    train_ordered_labels = np.array(train_labels)
+
     # train loader
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
@@ -159,7 +163,45 @@ def get_train_loader(args):
     n_data = len(train_dataset)
     print('number of samples: {}'.format(n_data))
 
-    return train_loader, n_data
+    return train_loader, train_ordered_labels, n_data
+
+
+def get_test_loader(args):
+    """get the train loader"""
+    data_folder = os.path.join(args.data_folder, 'validation')
+
+    if args.view == 'Lab':
+        mean = [(0 + 100) / 2, (-86.183 + 98.233) / 2, (-107.857 + 94.478) / 2]
+        std = [(100 - 0) / 2, (86.183 + 98.233) / 2, (107.857 + 94.478) / 2]
+        color_transfer = RGB2Lab()
+    elif args.view == 'YCbCr':
+        mean = [116.151, 121.080, 132.342]
+        std = [109.500, 111.855, 111.964]
+        color_transfer = RGB2YCbCr()
+    else:
+        raise NotImplemented('view not implemented {}'.format(args.view))
+    normalize = transforms.Normalize(mean=mean, std=std)
+
+    test_transform = transforms.Compose([
+        transforms.Resize(256),  # FIXME: hardcoded for 224 image size
+        transforms.CenterCrop(image_size),
+        color_transfer,
+        transforms.ToTensor(),
+        normalize,
+    ])
+    test_dataset = ImageFolderInstance(data_folder, transform=test_transform)
+    test_sampler = None
+
+    # train loader
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset, batch_size=args.batch_size, shuffle=(test_sampler is None),
+        num_workers=args.num_workers, pin_memory=True, sampler=test_sampler)
+
+    # num of samples
+    n_data = len(test_dataset)
+    print('number of samples: {}'.format(n_data))
+
+    return test_loader, n_data
 
 
 def set_model(args, n_data):
@@ -261,11 +303,52 @@ def train(epoch, train_loader, model, contrast, criterion_l, criterion_ab, optim
                    epoch, idx + 1, len(train_loader), batch_time=batch_time,
                    data_time=data_time, loss=losses, lprobs=l_prob_meter,
                    abprobs=ab_prob_meter))
-            print(out_l.shape)
             sys.stdout.flush()
 
     return l_loss_meter.avg, l_prob_meter.avg, ab_loss_meter.avg, ab_prob_meter.avg
 
+
+def evaluate(epoch, test_loader, model, contrast, train_ordered_labels, opt):
+    """
+    Estimate the classification accuracy by finding the nearest 
+    neighbor in the training set and taking its label.
+    """
+    memory_l = contrast.memory_l
+    memory_ab = contrast.memory_ab
+
+    memory = torch.cat((memory_l, memory_ab), dim=1)
+    num_correct, num_total = 0., 0.
+
+    model.eval()
+    contrast.eval()
+    with torch.no_grad():
+        for idx, (inputs, labels, index) in enumerate(test_loader):
+            inputs = inputs.float()
+            labels = labels.long()
+            if torch.cuda.is_available():
+                index = index.cuda(async=True)
+                inputs = inputs.cuda()
+                labels = labels.cuda()
+
+            feat_l, feat_ab = model(inputs)
+            feat = torch.cat((feat_l, feat_ab), dim=1)
+            
+            all_dps = torch.matmul(feat, torch.transpose(memory, 1, 0))
+            _, neighbor_idxs = torch.topk(all_dps, k=1, sorted=False, dim=1)
+            neighbor_idxs = neighbor_idxs.squeeze(1).cpu().numpy()
+            neighbor_labels = train_ordered_labels[neighbor_idxs]
+            neighbor_labels = torch.from_numpy(neighbor_labels).long()
+            num_correct += torch.sum(neighbor_labels == labels).item()
+            num_total += batch_size
+
+            if (idx + 1) % opt.print_freq == 0:
+                accuracy = num_correct / float(num_total)
+                print('Evaluate: [{0}][{1}/{2}]\t{accuracy}'.format(
+                      epoch, idx + 1, len(test_loader), 
+                      accuracy=accuracy))
+                sys.stdout.flush()
+
+    return accuracy
 
 def main():
 
@@ -273,7 +356,8 @@ def main():
     args = parse_option()
 
     # set the loader
-    train_loader, n_data = get_train_loader(args)
+    train_loader, train_ordered_labels, n_data = get_train_loader(args)
+    test_loader, n_test = get_test_loader(args)
 
     # set the model
     model, contrast, criterion_ab, criterion_l = set_model(args, n_data)
@@ -308,6 +392,7 @@ def main():
     # tensorboard
     logger = tb_logger.Logger(logdir=args.tb_folder, flush_secs=2)
 
+    val_accs = []
     # routine
     for epoch in range(args.start_epoch, args.epochs + 1):
 
@@ -317,8 +402,11 @@ def main():
         time1 = time.time()
         l_loss, l_prob, ab_loss, ab_prob = train(epoch, train_loader, model, contrast, criterion_l, criterion_ab,
                                                  optimizer, args)
+        val_acc = evaluate(epoch, test_loader, model, contrast, train_ordered_labels, args)
         time2 = time.time()
         print('epoch {}, total time {:.2f}'.format(epoch, time2 - time1))
+
+        val_accs.append(val_acc)
 
         # tensorboard logger
         logger.log_value('l_loss', l_loss, epoch)
@@ -335,6 +423,7 @@ def main():
                 'contrast': contrast.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'epoch': epoch,
+                'val_accs': np.array(val_accs),
             }
             if args.amp:
                 state['amp'] = amp.state_dict()
